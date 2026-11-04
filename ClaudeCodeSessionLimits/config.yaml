@@ -1,0 +1,102 @@
+# config.yaml — Claude Usage Guard
+# Percentuais de 0 a 100. Use 0 num limiar para desligá-lo.
+# Qualquer chave pode ser sobrescrita por env: CUG_<SEÇÃO>_<CHAVE>
+#   ex.: CUG_COMPACT_SESSION_THRESHOLD=55  CUG_FAILOVER_ENABLED=true
+
+# Intervalo entre consultas ao endpoint de uso (mínimo 30 s; o endpoint
+# limita requisições, e o cache é compartilhado entre run/dashboard/status).
+poll_interval_seconds: 120
+
+# Se o último dado de uso for mais velho que isso, as ações baseadas em uso
+# ficam pausadas (falha segura). Sinal de clear e contexto seguem valendo.
+max_stale_seconds: 900
+
+claude:
+  binary: claude            # nome no PATH ou caminho absoluto
+  extra_args: []            # ex.: ["--permission-mode", "acceptEdits"]
+                            # (não use --settings aqui: o guard já passa um)
+
+# Quando é seguro "digitar" um comando no prompt do Claude Code.
+idle:
+  output_quiet_seconds: 6   # tela sem atualizar há N s
+  input_quiet_seconds: 15   # você sem digitar há N s
+  min_gap_between_injections_seconds: 10
+  allow_without_hooks: false  # true = injeta mesmo sem confirmação dos hooks (NÃO recomendado)
+
+# b) Compactação inteligente
+compact:
+  enabled: true
+  session_threshold: 60     # % da janela de 5h; dispara uma vez por janela
+  context_tokens_threshold: 120000   # compacta quando o contexto passar disso (0 = off)
+  cooldown_seconds: 900
+
+# a) Limpeza de contexto
+clear:
+  enabled: true
+  on_signal: true           # `claude_usage_guard.py signal clear` agenda /clear para o fim da tarefa
+  idle_minutes: 0           # ex.: 30 = /clear após 30 min parado (o cache de prompt já expirou)
+                            # Cuidado: você perde o histórico da conversa.
+
+# c) Troca dinâmica de modelo
+model_switch:
+  enabled: true
+  session_threshold: 70     # % da janela de 5h
+  weekly_threshold: 85      # % da janela de 7d
+  model: haiku              # alias = Haiku mais recente; ou um id completo de modelo
+  restore: true             # volta ao modelo original quando o uso cair
+  restore_below: 50         # (normalmente quando a janela de 5h reinicia)
+  restore_model: default
+
+# d) Failover via proxy local
+#    Desligado por padrão. NÃO use para rodiziar várias contas Anthropic:
+#    isso viola os termos de uso. Use um backend que você controla ou paga
+#    (Ollama local/Cloud, LiteLLM com outro provedor, chave de API paga).
+failover:
+  enabled: false
+  session_threshold: 90
+  weekly_threshold: 95
+  base_url: http://127.0.0.1:8787   # vira ANTHROPIC_BASE_URL do claude
+  # Comando que inicia o proxy se ele não estiver respondendo. Lista de
+  # argumentos (sem shell). Confira as flags na documentação do seu proxy.
+  # Deixe [] se o proxy já roda como serviço.
+  command: []               # ex.: ["claude-spillway", "--port", "8787"]
+  health_path: /
+  startup_timeout_seconds: 20
+  # true = no meio da sessão, envia /exit e reabre a MESMA conversa
+  # (claude --resume <id>) apontando para o proxy. false = só avisa e o
+  # proxy vale na próxima vez que você abrir com `run`.
+  relaunch_session: false
+  stop_proxy_on_exit: true
+  # Variáveis extras para o claude quando o proxy está ativo. Aceita ${VAR}
+  # (prefira referenciar segredos do ambiente a escrevê-los aqui).
+  env: {}
+  #  ANTHROPIC_AUTH_TOKEN: ${OLLAMA_API_KEY}
+
+notifications:
+  desktop: true             # toast do Windows / notify-send (Linux) / osascript (macOS)
+
+dashboard:
+  refresh_seconds: 5        # também é o intervalo de atualização da janela
+  bar_width: 32
+
+gui:
+  open_on_run: true         # cada `run` abre a janela (uma só para todas as sessões)
+
+# Sessões da aba Code do Claude Desktop (instale com: claude_usage_guard.exe install-desktop).
+# Os hooks medem a cota e o contexto e mandam notas curtas "[usage-guard]" ao Claude.
+desktop:
+  enabled: true
+  attention_session: 60      # % da janela de 5h
+  attention_weekly: 70       # % da janela de 7d
+  high_session: 80
+  high_weekly: 85
+  critical_session: 92
+  critical_weekly: 95
+  context_tokens_threshold: 120000
+  context_repeat_tokens: 30000   # nova nota de contexto a cada +30k
+  toast: true
+  session_list_hours: 2      # janela do guard: some com sessões paradas há mais tempo
+  usage_fetch_timeout_seconds: 2
+  # O Desktop não renova o token do CLI (~/.claude/.credentials.json). Vencido,
+  # o guard pede ao claude uma chamada mínima (Haiku, ~500 tokens) que o renova.
+  refresh_auth_with_cli: true

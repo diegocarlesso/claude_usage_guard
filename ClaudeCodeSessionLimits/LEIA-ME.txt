@@ -1,0 +1,88 @@
+CLAUDE USAGE GUARD - Windows
+============================
+
+Arquivos desta pasta
+  claude_usage_guard.py     o programa (documentação completa no topo do arquivo)
+  config.yaml               limiares e ações (context_tokens_threshold = 120000)
+  build_exe.bat             gera o claude_usage_guard.exe
+  requirements-windows.txt  dependências para Windows (pywinpty, pyyaml)
+  assets\                   ícone do .exe/notificações e paleta do dashboard
+
+1) Instale o Python 3 (https://www.python.org/downloads/).
+   No instalador, marque "Add python.exe to PATH".
+
+2) Gere o .exe: dê duplo clique em build_exe.bat.
+   Resultado: dist\claude_usage_guard\claude_usage_guard.exe
+   (mantenha a pasta dist\claude_usage_guard inteira; o config.yaml é
+   copiado para lá, e é ESSE que o .exe usa.)
+
+   Sem .exe também funciona:
+       py -m pip install pywinpty
+       py claude_usage_guard.py run
+
+3) Verifique o ambiente (no PowerShell ou Windows Terminal):
+       cd F:\Projetos\ClaudeCodeSessionLimits\dist\claude_usage_guard
+       .\claude_usage_guard.exe check-config
+       .\claude_usage_guard.exe demo
+
+4) Uso diário: entre na pasta do SEU projeto e abra o Claude Code pelo guard:
+       cd F:\caminho\do\seu\projeto
+       F:\Projetos\ClaudeCodeSessionLimits\dist\claude_usage_guard\claude_usage_guard.exe run
+   Dica: adicione a pasta dist\claude_usage_guard ao PATH para digitar só
+   "claude_usage_guard run".
+
+5) Janela de acompanhamento: abre sozinha no primeiro "run" (uma só para
+   todas as sessões; fechar a janela não afeta o Claude). Mostra o uso 5h/7d,
+   cada sessão protegida (estado, modelo, contexto) e as ações recentes, com
+   os botões "Pedir /clear" e "Abrir log". Para abrir à mão:
+       claude_usage_guard.exe gui
+   Para não abrir com o run: no config.yaml, gui: open_on_run: false
+   O mesmo painel em texto, numa aba do terminal:
+       claude_usage_guard.exe dashboard
+
+6) Pedir /clear quando a tarefa atual terminar:
+       claude_usage_guard.exe signal clear
+
+7) Usar com o Claude Desktop (aba Code)
+   O Desktop não roda num terminal, então o "run" não serve para ele. Instale
+   uma vez (num PowerShell comum):
+       claude_usage_guard.exe install-desktop
+   O que isso faz:
+     - acrescenta 3 hooks do guard ao %USERPROFILE%\.claude\settings.json
+       (seus outros hooks e configurações ficam iguais; antes grava um
+       backup settings.json.bak-AAAAMMDD-HHMMSS ao lado);
+     - copia a skill economia-de-cota para %USERPROFILE%\.claude\skills\;
+     - cria o atalho "Claude Usage Guard" no Menu Iniciar (abre a janela).
+   O que muda: em cada sessão NOVA da aba Code, quando a cota passa de 60%
+   (5h) ou 70% (semana), o Claude recebe uma nota "[usage-guard]" e passa a
+   economizar (respostas diretas, subagentes mais baratos). Com a cota alta
+   (80%/85%) ou crítica (92%/95%) você também recebe uma notificação do
+   Windows (aparece como "Windows PowerShell"), e com o contexto acima de 120k
+   tokens o Claude sugere /compact ou /clear com um resumo em HANDOFF.md.
+   Nada é digitado por você: /compact, /clear e /model continuam com você.
+   A janela (atalho ou "claude_usage_guard.exe gui") mostra as sessões do
+   Desktop das últimas 2 horas e uma faixa amarela/vermelha com a cota alta.
+   Limiares: seção desktop: do config.yaml.
+   Se mudar a pasta do guard de lugar, rode install-desktop de novo
+   (check-config avisa). Para desfazer:
+       claude_usage_guard.exe uninstall-desktop
+   (tira só o que o guard pôs; se você editou a skill, ela fica.)
+
+Logs e estado: %USERPROFILE%\.claude-usage-guard\guard.log
+
+Bom saber
+  - Abra o guard num terminal comum (Windows Terminal, PowerShell, cmd), e
+    não de dentro de outra sessão do Claude Code: o claude filho herdaria as
+    variáveis da sessão de fora.
+  - Quando o guard troca o modelo (/model haiku), isso vale só para a sessão
+    aberta. O Claude Code grava o modelo escolhido como padrão no
+    %USERPROFILE%\.claude\settings.json, e o guard devolve o valor anterior
+    logo em seguida.
+  - "Permission denied" em %USERPROFILE%\.claude-usage-guard: algum arquivo
+    foi criado num terminal "como administrador". Corrija uma vez, num
+    terminal como administrador:
+        icacls "%USERPROFILE%\.claude-usage-guard" /reset /T /C /Q
+    (a versão 1.2.0 já cria as pastas de um jeito que não tem esse problema)
+  - Se nada for digitado pelo guard, rode com -v e veja no guard.log o motivo
+    ("tela mudando", "texto pela metade no campo", "aguardando permissão"...):
+        claude_usage_guard.exe -v run

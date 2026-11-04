@@ -1,0 +1,18 @@
+# Build (PyInstaller)
+ClaudeCodeSessionLimits/build/
+ClaudeCodeSessionLimits/dist/
+*.spec
+__pycache__/
+*.pyc
+
+# Testes e rascunhos
+.pytest_cache/
+.superpowers/
+_e2e/*.log
+_e2e/lowpriv.txt
+_e2e/proj/
+
+# Cópias locais (o código vive em ClaudeCodeSessionLimits/)
+/assets/
+/claude_usage_guard/
+*.zip
