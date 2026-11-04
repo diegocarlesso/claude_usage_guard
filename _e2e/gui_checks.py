@@ -7,7 +7,13 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
+
+# Pasta de estado temporária (antes de importar o guard, que a lê na carga); os
+# subprocessos da janela única a herdam. Nada vai para o ~/.claude-usage-guard real.
+STATE_TMP = tempfile.mkdtemp(prefix="cug-guichecks-")
+os.environ["CUG_STATE_DIR"] = STATE_TMP
 
 spec = importlib.util.spec_from_file_location("cug", sys.argv[1])
 cug = importlib.util.module_from_spec(spec)
@@ -55,6 +61,36 @@ try:
 finally:
     shutil.rmtree(d, ignore_errors=True)
 
+# botões das sessões do Desktop (1.4.0): "Compactar" grava a fila e vira "✓ Compactar"
+sid = "e2e0e2e0-0000-4000-8000-guichecks000"
+desk = [cug.DesktopSessionState(sid, cwd=os.getcwd(), updated_at=time.time(), last_event="Stop")]
+pend = cug.desktop_pending_path(sid)
+try:
+    win = cug.GuardWindow(cfg, lambda: (None, None, [], [], desk))
+    win.refresh(reschedule=False)
+    btns = {}
+
+    def walk_btn(w):
+        for c in w.winfo_children():
+            if c.winfo_class() == "Button":
+                btns[c.cget("text")] = c
+            walk_btn(c)
+    walk_btn(win.root)
+    check("4 botões no cartão do Desktop", {"Compactar", "Economizar", "Skills/MCPs", "Pesquisar"} <= set(btns),
+          str(sorted(btns)))
+    btns["Compactar"].invoke()
+    win.root.update()
+    check("Compactar grava a fila", cug.read_pending(sid) == ["compact"], str(cug.read_pending(sid)))
+    btns.clear()
+    walk_btn(win.root)
+    check("botão vira '✓ Compactar'", "✓ Compactar" in btns, str(sorted(btns)))
+    check("rodapé diz quando vai", "próxima mensagem" in win.footer_note.cget("text"), win.footer_note.cget("text"))
+    btns["✓ Compactar"].invoke()
+    check("segundo clique cancela", cug.read_pending(sid) == [] and not pend.exists())
+    win.root.destroy()
+finally:
+    pend.unlink(missing_ok=True)
+
 # janela única: a 1ª fica aberta; a 2ª sai na hora dizendo que já está aberta
 first = subprocess.Popen([*GUARD, "gui"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 end = time.time() + 20
@@ -66,4 +102,5 @@ check("2ª janela não abre", "já está aberta" in second.stdout and second.ret
 check("1ª janela continua aberta", first.poll() is None)
 first.terminate()
 first.wait(10)
+shutil.rmtree(STATE_TMP, ignore_errors=True)
 print("TUDO OK" if ok_all else "HÁ FALHAS")

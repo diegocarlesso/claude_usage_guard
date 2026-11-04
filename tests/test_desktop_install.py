@@ -165,3 +165,36 @@ def test_restore_default_model_keeps_bom_and_crlf(cug, claude_dir):
     assert cug.restore_default_model("sonnet") is True
     assert path.read_bytes() == b'\xef\xbb\xbf{\r\n  "model": "sonnet"\r\n}\r\n'
     assert cug.read_default_model() == "sonnet"
+
+
+def test_install_uninstall_all_skills(cug, claude_dir):
+    cfg, _ = cug.load_config(None)
+    assert cug.cmd_install_desktop(cfg, ns()) == 0
+    for name in cug.SKILL_NAMES:
+        dst = claude_dir / "skills" / name / "SKILL.md"
+        assert dst.read_bytes() == cug.asset_path(cug.skill_asset(name)).read_bytes()
+    edited = claude_dir / "skills" / "pesquisar-otimizacoes" / "SKILL.md"
+    edited.write_text("minha", encoding="utf-8")
+    assert cug.cmd_uninstall_desktop(cfg, ns()) == 0
+    assert edited.read_text(encoding="utf-8") == "minha"
+    assert not (claude_dir / "skills" / "ferramentas-do-projeto").exists()
+
+
+def test_previous_packaged_skill_is_upgraded_without_force(cug, claude_dir, monkeypatch, capsys):
+    import hashlib
+    old = "versão empacotada antiga".encode("utf-8")
+    monkeypatch.setitem(cug.SKILL_PREVIOUS_SHA256, "economia-de-cota", {hashlib.sha256(old).hexdigest()})
+    skill = claude_dir / "skills" / "economia-de-cota" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_bytes(old)
+    cfg, _ = cug.load_config(None)
+    assert cug.cmd_install_desktop(cfg, ns()) == 0
+    assert skill.read_bytes() == cug.asset_path("skills/economia-de-cota/SKILL.md").read_bytes()
+    assert "foi modificada" not in capsys.readouterr().out
+    skill.write_bytes(old)                                   # desinstalar também a reconhece
+    assert cug.cmd_uninstall_desktop(cfg, ns()) == 0
+    assert not skill.exists()
+
+
+def test_skill_from_1_3_0_is_known(cug):
+    assert "1a1a597eda9fd25216cd3f8ad057a6d4cfd98c96bd6d8a6555d13b3bfc78e817" in cug.SKILL_PREVIOUS_SHA256["economia-de-cota"]

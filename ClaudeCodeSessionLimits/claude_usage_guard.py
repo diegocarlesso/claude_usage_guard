@@ -103,9 +103,9 @@ CLAUDE DESKTOP (ABA CODE)
 -----------------------------------------------------------------------------
   O Desktop não roda num terminal, então o `run` não serve para ele. Em vez
   disso, `install-desktop` registra hooks no ~/.claude/settings.json (só as
-  entradas do guard; o resto fica intacto, com backup) e instala a skill
-  economia-de-cota:
-      claude_usage_guard.exe install-desktop     # --force troca a skill editada
+  entradas do guard; o resto fica intacto, com backup) e instala as skills
+  economia-de-cota, ferramentas-do-projeto e pesquisar-otimizacoes:
+      claude_usage_guard.exe install-desktop     # --force troca skill editada
       claude_usage_guard.exe uninstall-desktop   # tira só o que instalou
   Em cada sessão nova da aba Code, o hook `desktop-hook` mede a cota (cache
   compartilhado, rede só se velho, 2 s no máximo) e o contexto (transcript) e,
@@ -116,6 +116,12 @@ CLAUDE DESKTOP (ABA CODE)
   trocar o modelo: o guard leva o Claude e você a fazer isso. O "model" do
   settings.json não é alterado (o Desktop o ignora). Limiares: seção desktop:
   do config.yaml.
+  Botões na janela, por sessão (fila em desktop\pending\<sessão>.json):
+  Compactar (HANDOFF.md + linha /compact pronta), Economizar (liga/desliga o
+  modo econômico), Skills/MCPs (skill ferramentas-do-projeto) e Pesquisar
+  (skill pesquisar-otimizacoes, grava OTIMIZACOES.md). O pedido chega ao
+  Claude no fim do turno atual (hook Stop com decision:block) ou junto da sua
+  próxima mensagem. Clicar de novo num pedido pendente o cancela.
 
 -----------------------------------------------------------------------------
 LIMITAÇÕES, SEGURANÇA E TERMOS DE USO
@@ -143,6 +149,7 @@ import contextlib
 import dataclasses
 import datetime as dt
 import errno
+import hashlib
 import json
 import logging
 import logging.handlers
@@ -163,7 +170,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Iterator, Optional
+from typing import Any, Callable, Iterable, Iterator, Optional
 
 IS_WINDOWS = os.name == "nt"
 if IS_WINDOWS:
@@ -176,7 +183,7 @@ else:
     import termios
     import tty
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 log = logging.getLogger("claude_usage_guard")
 
@@ -1281,6 +1288,44 @@ def context_note(tokens: int) -> str:
             "usuário /compact (mesmo assunto) ou /clear com resumo de passagem (assunto novo).")
 
 
+# Pedidos dos botões da janela (fila por sessão, entregue pelo desktop-hook).
+# Ordem da tupla = ordem de entrega, não importa a ordem dos cliques.
+PENDING_ACTIONS = ("economy_on", "economy_off", "compact", "tools", "research")
+ACTION_LABELS = {"economy_on": "Economizar", "economy_off": "Desligar economia", "compact": "Compactar",
+                 "tools": "Skills/MCPs", "research": "Pesquisar"}
+_ACTION_OPPOSITE = {"economy_on": "economy_off", "economy_off": "economy_on"}
+
+
+_REQUEST_HEADER = {
+    "Stop": "Pedido do usuário pelo botão \"{label}\" do Claude Usage Guard (não é erro; faça agora): ",
+    "UserPromptSubmit": ("Pedido do usuário pelo botão \"{label}\" do Claude Usage Guard (faça antes do resto da "
+                         "mensagem dele): "),
+}
+_REQUEST_TEXT = {
+    "compact": ("grave HANDOFF.md (modelo da skill economia-de-cota) e devolva uma linha pronta \"/compact <o que "
+                "manter>\" para ele colar. Não comece tarefa nova antes. Se o próximo assunto for outro, recomende "
+                "/clear e depois ler o HANDOFF.md."),
+    "economy_on": ("modo econômico nesta sessão até ele desligar (skill economia-de-cota, nível attention). "
+                   "Confirme em uma linha."),
+    "economy_off": ("modo econômico desligado; volte ao normal, a menos que outra nota [usage-guard] de cota peça "
+                    "economia. Confirme em uma linha."),
+    "tools": ("use a skill ferramentas-do-projeto: analise o projeto, sugira skills, MCPs, plugins e hooks (o que "
+              "pôr e o que tirar) e instale só o que ele aprovar."),
+    "research": ("use a skill pesquisar-otimizacoes: pesquise primeiro como usar o Claude Code neste projeto "
+                 "gastando menos, depois boas práticas do stack; grave OTIMIZACOES.md e proponha as 3 a 5 mudanças "
+                 "de maior ganho; aplique só o que ele aprovar."),
+}
+ECONOMY_REMINDER = (f"{NOTE_PREFIX} Modo econômico ligado pelo usuário nesta sessão (skill economia-de-cota, "
+                    "nível attention).")
+
+
+def request_notes(actions: list[str], event: str) -> str:
+    """Texto dos pedidos para o Claude: uma linha por ação, cabeçalho conforme
+    o canal (fim do turno pelo Stop ou junto da mensagem do usuário)."""
+    header = _REQUEST_HEADER[event]
+    return "\n".join(f"{NOTE_PREFIX} {header.format(label=ACTION_LABELS[a])}{_REQUEST_TEXT[a]}" for a in actions)
+
+
 _LEVEL_HEADLINE = {"attention": "em atenção", "high": "alta", "critical": "crítica"}
 TOAST_TITLE = "Claude Usage Guard"
 
@@ -1307,6 +1352,11 @@ class DesktopSessionState:
     last_note: Optional[str] = None
     last_note_at: float = 0.0
     context_toast_done: bool = False
+    last_event: Optional[str] = None
+    economy_mode: bool = False          # modo econômico ligado pelo botão da janela
+    delivered_actions: list[str] = dataclasses.field(default_factory=list)
+    delivered_at: float = 0.0
+    delivered_via: Optional[str] = None  # "Stop" (fim do turno) ou "UserPromptSubmit"
 
     def to_json(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
@@ -1315,6 +1365,31 @@ class DesktopSessionState:
     def from_json(cls, d: dict[str, Any]) -> "DesktopSessionState":
         names = {f.name for f in dataclasses.fields(cls)}
         return cls(**{k: v for k, v in d.items() if k in names})
+
+
+def apply_delivery(state: DesktopSessionState, actions: list[str], event: str, now: float) -> DesktopSessionState:
+    """Estado da sessão depois de entregar os pedidos (pura)."""
+    st = dataclasses.replace(state, delivered_actions=list(actions), delivered_at=now, delivered_via=event)
+    if "economy_on" in actions:
+        st.economy_mode = True
+    if "economy_off" in actions:
+        st.economy_mode = False
+    # Nota curta: o texto inteiro dos pedidos deixaria o cartão da janela alto.
+    st.last_note = f"{NOTE_PREFIX} entregues: " + ", ".join(ACTION_LABELS.get(a, a) for a in actions)
+    st.last_note_at = now
+    return st
+
+
+def merge_concurrent_delivery(state: DesktopSessionState,
+                              on_disk: Optional[DesktopSessionState]) -> DesktopSessionState:
+    """Dois hooks do guard em paralelo gravam o mesmo arquivo sem trava: se o
+    disco já traz uma entrega mais nova que a que este hook leu, mantém o modo
+    econômico e os campos delivered_* do disco em vez de sobrescrevê-los."""
+    if on_disk is None or on_disk.delivered_at <= state.delivered_at:
+        return state
+    return dataclasses.replace(state, economy_mode=on_disk.economy_mode,
+                               delivered_actions=list(on_disk.delivered_actions),
+                               delivered_at=on_disk.delivered_at, delivered_via=on_disk.delivered_via)
 
 
 @dataclasses.dataclass
@@ -1361,6 +1436,8 @@ def advise(cfg: dict[str, Any], snap: Optional[UsageSnapshot], state: DesktopSes
                 toasts.append(ToastRequest(f"{win}:{_reset_key(fresh, win)}:{level}", TOAST_TITLE,
                                            quota_headline(level, win, w.utilization, w.resets_in(now))))
         st.last_level = level
+    if event == "SessionStart" and source in ("clear", "compact") and st.economy_mode:
+        notes.append(ECONOMY_REMINDER)  # /clear e /compact apagam a instrução do contexto
 
     tokens = st.context_tokens
     if (event == "UserPromptSubmit" and tokens is not None and tokens >= d["context_tokens_threshold"]
@@ -2439,10 +2516,48 @@ def list_desktop_sessions(hours: float, now: Optional[float] = None) -> list[Des
             st = DesktopSessionState.from_json(data)
         except TypeError:
             continue
-        if isinstance(st.updated_at, (int, float)) and now - st.updated_at <= hours * 3600:
+        recent = isinstance(st.updated_at, (int, float)) and now - st.updated_at <= hours * 3600
+        # Sessão com pedido pendente continua visível (para cancelar) até o pedido expirar.
+        if recent or (SESSION_ID_RE.fullmatch(str(st.session_id)) and read_pending(st.session_id)):
             out.append(st)
+    with contextlib.suppress(OSError):  # pedidos de sessões que nunca mais rodaram
+        for f in pending_dir().glob("*.json"):
+            with contextlib.suppress(OSError):
+                if now - f.stat().st_mtime > DESKTOP_STATE_KEEP_SECONDS:
+                    f.unlink()
     out.sort(key=lambda st: st.updated_at, reverse=True)
     return out
+
+
+DESKTOP_CARDS = 4
+DELIVERED_SHOW_SECONDS = 600
+
+
+def economy_button(pending: list[str], economy_mode: bool) -> tuple[str, str]:
+    """(rótulo, ação do clique) do botão de modo econômico."""
+    if "economy_on" in pending:
+        return "✓ Economizar", "economy_on"
+    if "economy_off" in pending:
+        return "✓ Desligar economia", "economy_off"
+    return ("Economizar: ligado", "economy_off") if economy_mode else ("Economizar", "economy_on")
+
+
+def desktop_status_line(pending: list[str], st: DesktopSessionState, now: float, critical: bool) -> Optional[str]:
+    """Linha de situação dos pedidos de um cartão (None se nada a dizer)."""
+    parts: list[str] = []
+    if pending:
+        names = ", ".join(ACTION_LABELS[a] for a in pending)
+        if st.last_event == "UserPromptSubmit":  # o Claude está no meio de um turno
+            parts.append(f"pendente: {names} · vai no fim do turno atual (ou com a sua próxima mensagem)")
+        else:
+            parts.append(f"pendente: {names} · vai junto com a sua próxima mensagem (até um 'ok' serve)")
+    elif st.delivered_actions and 0 <= now - st.delivered_at < DELIVERED_SHOW_SECONDS:
+        names = ", ".join(ACTION_LABELS.get(a, a) for a in st.delivered_actions)
+        via = "fim do turno" if st.delivered_via == "Stop" else "sua mensagem"
+        parts.append(f"entregue há {_fmt_duration(now - st.delivered_at)}: {names} ({via})")
+    if critical:
+        parts.append("pesquisa e skills pausadas: cota crítica")
+    return " · ".join(parts) or None
 
 
 def gui_running() -> bool:
@@ -2496,7 +2611,7 @@ class GuardWindow:
         self.root = root = tk.Tk()
         root.title("Claude Usage Guard")
         root.configure(bg=GUI_COLORS["bg"])
-        root.geometry("600x780")
+        root.geometry("600x840")
         root.minsize(520, 420)
         icon = asset_path("app.ico")
         if icon and IS_WINDOWS:
@@ -2510,8 +2625,30 @@ class GuardWindow:
         self.f_section = tkfont.Font(family=family, size=11, weight="bold")
         footer = tk.Frame(root, bg=GUI_COLORS["bg"], padx=16, pady=10)
         footer.pack(fill="x", side="bottom")  # antes do corpo: fica visível mesmo com a janela baixa
-        self.body = tk.Frame(root, bg=GUI_COLORS["bg"], padx=16, pady=12)
-        self.body.pack(fill="both", expand=True)
+        # Corpo rolável: Canvas + barra vertical; a roda do mouse também rola.
+        view = tk.Frame(root, bg=GUI_COLORS["bg"])
+        view.pack(fill="both", expand=True)
+        from tkinter import ttk
+        style = ttk.Style(root)
+        with contextlib.suppress(tk.TclError):
+            style.theme_use("clam")  # o tema nativo do Windows ignora cores: a barra sumia no fundo preto
+        style.configure("Guard.Vertical.TScrollbar", background=GUI_COLORS["dim"], troughcolor=GUI_COLORS["panel"],
+                        bordercolor=GUI_COLORS["bg"], arrowcolor=GUI_COLORS["fg"], lightcolor=GUI_COLORS["dim"],
+                        darkcolor=GUI_COLORS["dim"])
+        style.map("Guard.Vertical.TScrollbar", background=[("active", GUI_COLORS["normal"])])
+        self.scrollbar = ttk.Scrollbar(view, orient="vertical", style="Guard.Vertical.TScrollbar")
+        self.scrollbar.pack(side="right", fill="y")
+        self.canvas = canvas = tk.Canvas(view, bg=GUI_COLORS["bg"], highlightthickness=0, bd=0,
+                                         yscrollcommand=self.scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        self.scrollbar.configure(command=canvas.yview)
+        self.body = tk.Frame(canvas, bg=GUI_COLORS["bg"], padx=16, pady=12)
+        body_item = canvas.create_window((0, 0), window=self.body, anchor="nw")
+        self.body.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(body_item, width=e.width))
+        root.bind_all("<MouseWheel>", lambda e: canvas.yview_scroll(-1 if e.delta > 0 else 1, "units"))
+        root.bind_all("<Button-4>", lambda _e: canvas.yview_scroll(-1, "units"))  # Linux
+        root.bind_all("<Button-5>", lambda _e: canvas.yview_scroll(1, "units"))
         self._button(footer, "Abrir log", self._open_log).pack(side="right")
         self.footer_note = self._label(footer, "", "dim", self.f_small)
         self.footer_note.pack(side="left")
@@ -2556,6 +2693,26 @@ class GuardWindow:
             self.footer_note.configure(text=f"não deu para pedir /clear: {why}", fg=GUI_COLORS["crit"])
         self.refresh(reschedule=False)
 
+    def _toggle_request(self, sid: str, action: str, expect_pending: bool, busy: bool = False) -> None:
+        """Clique num botão de uma sessão do Desktop: pede ou cancela."""
+        label = ACTION_LABELS[action]
+        try:
+            pending = toggle_request(sid, action, time.time(), expect_pending=expect_pending)
+        except (OSError, GuardError, ValueError) as exc:
+            self.footer_note.configure(text=f"não deu para registrar o pedido (tente de novo): {exc}",
+                                       fg=GUI_COLORS["crit"])
+        else:
+            when = "vai no fim do turno atual" if busy else "vai com a sua próxima mensagem"
+            if pending is None:  # a janela estava desatualizada
+                text = (f"{label} já tinha sido entregue a #{sid[:8]}" if expect_pending
+                        else f"{label} já estava pendente para #{sid[:8]}")
+            elif pending:
+                text = f"{label} pedido para #{sid[:8]}: {when}"
+            else:
+                text = f"{label} cancelado para #{sid[:8]}"
+            self.footer_note.configure(text=text, fg=GUI_COLORS["dim"])
+        self.refresh(reschedule=False)
+
     # ---- desenho -------------------------------------------------------------
     def refresh(self, reschedule: bool = True) -> None:
         try:
@@ -2569,8 +2726,10 @@ class GuardWindow:
              actions: list[dict[str, Any]], desktop: Optional[list[DesktopSessionState]] = None,
              now: Optional[float] = None) -> None:
         now = now or time.time()
+        top = self.canvas.yview()[0]  # redesenhar não pode jogar a rolagem de volta ao topo
         for child in self.body.winfo_children():
             child.destroy()
+        self.root.after_idle(lambda: self._restore_scroll(top))
         head = self.tk.Frame(self.body, bg=GUI_COLORS["bg"])
         head.pack(fill="x")
         self._label(head, "Claude Usage Guard", "normal", self.f_title).pack(side="left")
@@ -2580,9 +2739,14 @@ class GuardWindow:
         level, window = quota_level(self.cfg, fresh)
         self._draw_banner(level, window, fresh, now)
         self._draw_usage(snap, err, now)
-        self._draw_desktop_sessions(desktop or [], now)
+        self._draw_desktop_sessions(desktop or [], now, level)
         self._draw_sessions(instances, now)
         self._draw_actions(actions)
+
+    def _restore_scroll(self, top: float) -> None:
+        self.body.update_idletasks()
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        self.canvas.yview_moveto(top)
 
     def _draw_banner(self, level: str, window: Optional[str], snap: Optional[UsageSnapshot], now: float) -> None:
         """Faixa no topo quando a cota da conta está alta (amarelo) ou crítica (vermelho)."""
@@ -2595,13 +2759,17 @@ class GuardWindow:
         self._label(band, quota_headline(level, window, w.utilization, w.resets_in(now)), "bg", self.f_bold,
                     bg=color).pack(fill="x")
 
-    def _draw_desktop_sessions(self, sessions: list[DesktopSessionState], now: float) -> None:
+    def _draw_desktop_sessions(self, sessions: list[DesktopSessionState], now: float, level: str = "normal") -> None:
         self._section("Sessões do Desktop")
+        enabled = bool(self.cfg["desktop"]["enabled"])
+        if not enabled:
+            self._label(self.body, "modo Desktop desligado no config (desktop.enabled): os botões não entregam "
+                        "pedidos", "warn", self.f_small).pack(fill="x")
         if not sessions:
             hours = self.cfg["desktop"]["session_list_hours"]
             self._label(self.body, f"nenhuma nas últimas {hours:g}h (para ativar: claude_usage_guard "
                         "install-desktop)", "dim").pack(fill="x")
-        for st in sessions[:6]:
+        for st in sessions[:DESKTOP_CARDS]:
             card = self.tk.Frame(self.body, bg=GUI_COLORS["panel"], padx=10, pady=5)
             card.pack(fill="x", pady=2)
             top = self.tk.Frame(card, bg=GUI_COLORS["panel"])
@@ -2618,8 +2786,33 @@ class GuardWindow:
             if st.last_note:
                 self._label(card, st.last_note.removeprefix(NOTE_PREFIX).strip(), "dim", self.f_small,
                             wraplength=540).pack(fill="x")
-        if len(sessions) > 6:
-            self._label(self.body, f"+ {len(sessions) - 6} outras", "dim", self.f_small).pack(fill="x")
+            self._draw_request_buttons(card, st, now, enabled, level == "critical")
+        if len(sessions) > DESKTOP_CARDS:
+            self._label(self.body, f"+ {len(sessions) - DESKTOP_CARDS} outras", "dim", self.f_small).pack(fill="x")
+
+    def _draw_request_buttons(self, card: Any, st: DesktopSessionState, now: float, enabled: bool,
+                              critical: bool) -> None:
+        """Botões Compactar / Economizar / Skills/MCPs / Pesquisar e a linha de situação."""
+        try:
+            pending = read_pending(st.session_id)
+        except GuardError:
+            return  # id inválido: nunca grava fila
+        busy = st.last_event == "UserPromptSubmit"
+        row = self.tk.Frame(card, bg=GUI_COLORS["panel"])
+        row.pack(fill="x", pady=(4, 0))
+        eco_label, eco_action = economy_button(pending, st.economy_mode)
+        buttons = [("compact", None), (eco_action, eco_label), ("tools", None), ("research", None)]
+        for action, label in buttons:
+            is_pending = action in pending
+            text = label or (f"✓ {ACTION_LABELS[action]}" if is_pending else ACTION_LABELS[action])
+            # Com cota crítica, pesquisa e skills ficam pausadas (um pedido já pendente ainda pode ser cancelado).
+            ok = enabled and (is_pending or not (critical and action in ("tools", "research")))
+            self._button(row, text, lambda a=action, p=is_pending: self._toggle_request(st.session_id, a, p, busy),
+                         enabled=ok).pack(side="left", padx=(0, 6))
+        line = desktop_status_line(pending, st, now, critical)
+        if line:
+            self._label(card, line, "warn" if pending else "dim", self.f_small, wraplength=540).pack(fill="x",
+                                                                                                  pady=(3, 0))
 
     def _draw_usage(self, snap: Optional[UsageSnapshot], err: Optional[str], now: float) -> None:
         self._section("Uso")
@@ -2931,6 +3124,7 @@ def cmd_hook(_cfg: Any, _args: argparse.Namespace) -> int:
 DESKTOP_EVENTS = ("SessionStart", "UserPromptSubmit", "Stop")
 HOOK_DEADLINE_SECONDS = 4.0     # o Claude Code corta o hook em 5 s
 HOOK_FETCH_MAX_SECONDS = 2.5
+HOOK_REQUEST_CUTOFF_SECONDS = 2.5  # depois disso o hook não mexe na fila (o prazo de 4 s poderia cortá-lo)
 FETCH_BACKOFF_SECONDS = 60
 SESSION_ID_RE = re.compile(r"[0-9A-Za-z-]{8,80}")
 ALERT_KEEP_SECONDS = 8 * 86400
@@ -2946,6 +3140,137 @@ def desktop_state_path(session_id: str) -> Path:
     if not isinstance(session_id, str) or not SESSION_ID_RE.fullmatch(session_id):
         raise GuardError(f"session_id inválido: {str(session_id)[:40]!r}")
     return desktop_dir() / f"{session_id}.json"
+
+
+# Fila de pedidos dos botões da janela (entregue pelo desktop-hook)
+
+
+PENDING_MAX_AGE_SECONDS = 4 * 3600  # pedido não entregue em 4 h expira
+
+
+def pending_dir() -> Path:
+    return desktop_dir() / "pending"
+
+
+def pending_lock_path() -> Path:
+    return desktop_dir() / "pending.lock"
+
+
+def desktop_pending_path(session_id: str) -> Path:
+    """Fila de pedidos da sessão (id validado como em desktop_state_path)."""
+    desktop_state_path(session_id)
+    return pending_dir() / f"{session_id}.json"
+
+
+def _ordered(actions: Iterable[str]) -> list[str]:
+    wanted = set(actions)
+    return [a for a in PENDING_ACTIONS if a in wanted]
+
+
+_WARNED_BAD_QUEUES: set[tuple[str, int]] = set()
+
+
+def _load_requests(path: Path) -> dict[str, float]:
+    """ação → hora do pedido. Arquivo ausente, corrompido ou velho = fila vazia
+    (um pedido esquecido não pode chegar a uma sessão retomada dias depois)."""
+    try:
+        if time.time() - path.stat().st_mtime > PENDING_MAX_AGE_SECONDS:
+            return {}
+    except OSError:
+        return {}
+    data = read_json(path)
+    reqs = data.get("requests") if isinstance(data, dict) else None
+    if not isinstance(reqs, list):
+        # A janela relê a fila a cada 5 s: avisa uma vez por versão do arquivo.
+        key = (str(path), path.stat().st_mtime_ns if path.exists() else 0)
+        if key not in _WARNED_BAD_QUEUES:
+            _WARNED_BAD_QUEUES.add(key)
+            log.warning("fila de pedidos ilegível, tratada como vazia: %s", path)
+        return {}
+    out: dict[str, float] = {}
+    for r in reqs:
+        if isinstance(r, dict) and r.get("action") in PENDING_ACTIONS:
+            at = r.get("at")
+            out[r["action"]] = float(at) if isinstance(at, (int, float)) else 0.0
+    return out
+
+
+def _save_requests(path: Path, session_id: str, reqs: dict[str, float]) -> None:
+    if not reqs:
+        with contextlib.suppress(FileNotFoundError):
+            path.unlink()
+        return
+    atomic_write_json(path, {"session_id": session_id,
+                             "requests": [{"action": a, "at": reqs[a]} for a in _ordered(reqs)]})
+
+
+def read_pending(session_id: str) -> list[str]:
+    """Ações pendentes, na ordem de entrega (sem trava: só para mostrar)."""
+    return _ordered(_load_requests(desktop_pending_path(session_id)))
+
+
+def toggle_request(session_id: str, action: str, now: float, expect_pending: Optional[bool] = None,
+                   lock_timeout: float = 2.0) -> Optional[bool]:
+    """Clique num botão: pede a ação ou, se já pendente, cancela. Devolve se
+    ela ficou pendente. Com `expect_pending`, só age se o disco ainda mostra o
+    que a janela mostrava; se não mostra (ex.: o hook já entregou o pedido que
+    o clique queria cancelar), não muda nada e devolve None."""
+    if action not in PENDING_ACTIONS:
+        raise ValueError(f"ação desconhecida: {action!r}")
+    path = desktop_pending_path(session_id)
+    with file_lock(pending_lock_path(), timeout=lock_timeout):
+        reqs = _load_requests(path)
+        pending = action in reqs
+        if expect_pending is not None and pending != expect_pending:
+            return None
+        if pending:
+            del reqs[action]
+        else:
+            reqs.pop(_ACTION_OPPOSITE.get(action, ""), None)
+            reqs[action] = now
+        _save_requests(path, session_id, reqs)
+        return not pending
+
+
+CLEAR_INHERIT_SECONDS = 600
+
+
+def inherit_economy_mode(cwd: str, session_id: str, now: float) -> bool:
+    """Depois de /clear (id de sessão novo): o modo econômico estava ligado na
+    sessão mais recente da mesma pasta, ativa nos últimos 10 minutos?"""
+    best: Optional[DesktopSessionState] = None
+    with contextlib.suppress(OSError):
+        for f in desktop_dir().glob("*.json"):
+            data = read_json(f)
+            if not isinstance(data, dict) or data.get("session_id") == session_id or data.get("cwd") != cwd:
+                continue
+            with contextlib.suppress(TypeError):
+                st = DesktopSessionState.from_json(data)
+                if (isinstance(st.updated_at, (int, float)) and 0 <= now - st.updated_at <= CLEAR_INHERIT_SECONDS
+                        and (best is None or st.updated_at > best.updated_at)):
+                    best = st
+    return bool(best and best.economy_mode)
+
+
+def take_requests(session_id: str, lock_timeout: float = 1.0) -> list[str]:
+    """Retira da fila todas as ações pendentes (o hook as entrega em seguida)."""
+    path = desktop_pending_path(session_id)
+    with file_lock(pending_lock_path(), timeout=lock_timeout):
+        reqs = _load_requests(path)
+        with contextlib.suppress(FileNotFoundError):
+            path.unlink()
+    return _ordered(reqs)
+
+
+def restore_requests(session_id: str, actions: list[str], now: float, lock_timeout: float = 1.0) -> None:
+    """Devolve à fila ações retiradas que não chegaram a ser escritas."""
+    path = desktop_pending_path(session_id)
+    with file_lock(pending_lock_path(), timeout=lock_timeout):
+        reqs = _load_requests(path)
+        for a in actions:
+            if a in PENDING_ACTIONS and a not in reqs and _ACTION_OPPOSITE.get(a) not in reqs:
+                reqs[a] = now
+        _save_requests(path, session_id, reqs)
 
 
 def load_snapshot_for_hook(cfg: dict[str, Any], network: bool = True) -> Optional[UsageSnapshot]:
@@ -3089,6 +3414,7 @@ def filter_new_toasts(toasts: list[ToastRequest], now: float) -> list[ToastReque
 def cmd_desktop_hook(cfg: dict[str, Any], _args: argparse.Namespace) -> int:
     """Hook das sessões do Claude Desktop (SessionStart, UserPromptSubmit,
     Stop). Só escreve no stdout o JSON da nota; nunca falha."""
+    started = time.monotonic()
     raw = sys.stdin.buffer.read(2_000_000).decode("utf-8", "replace")
     if not cfg["desktop"]["enabled"] or not raw.strip():
         return 0
@@ -3107,25 +3433,66 @@ def cmd_desktop_hook(cfg: dict[str, Any], _args: argparse.Namespace) -> int:
     if isinstance(stored, dict):
         with contextlib.suppress(TypeError):
             state = DesktopSessionState.from_json(stored)
-    if state is None or state.session_id != data["session_id"]:
+    is_new = state is None or state.session_id != data["session_id"]
+    if is_new:
         state = DesktopSessionState(data["session_id"])
     state.cwd = str(data.get("cwd") or state.cwd)[:1024]
     state.transcript_path = str(data.get("transcript_path") or state.transcript_path)[:1024]
     state.updated_at = now
+    state.last_event = event
+    source = data.get("source") if isinstance(data.get("source"), str) else None
+    if is_new and event == "SessionStart" and source == "clear":
+        # O /clear abre uma sessão com id novo: o modo econômico vem da anterior.
+        state.economy_mode = inherit_economy_mode(state.cwd, state.session_id, now)
     if event == "Stop" and state.transcript_path:
         tokens = read_context_tokens(state.transcript_path)
         if tokens is not None:
             state.context_tokens, state.context_measured_at = tokens, now
-    source = data.get("source") if isinstance(data.get("source"), str) else None
     snap = load_snapshot_for_hook(cfg, network=event != "Stop")
     notes, toasts, state = advise(cfg, snap, state, event, source, now)
-    atomic_write_json(path, state.to_json())
-    if notes:
-        log.info("desktop-hook: %s %s: %s", event, state.session_id[:8], " | ".join(notes))
-        out = {"hookSpecificOutput": {"hookEventName": event, "additionalContext": "\n".join(notes)}}
-        # ASCII puro: o JSON chega igual qualquer que seja a codificação do pipe.
-        sys.stdout.buffer.write(json.dumps(out).encode("ascii"))
-        sys.stdout.flush()
+    # Pedidos dos botões: retirados da fila só agora, logo antes de escrever.
+    # Retirar (e não ler e apagar depois) evita entregar duas vezes quando dois
+    # hooks do guard rodam em paralelo; perto do prazo, nem mexe na fila.
+    actions: list[str] = []
+    wants = event == "UserPromptSubmit" or (event == "Stop" and data.get("stop_hook_active") is not True)
+    elapsed = time.monotonic() - started
+    if wants and elapsed < HOOK_REQUEST_CUTOFF_SECONDS:
+        try:  # espera da trava limitada para caber no prazo do hook
+            actions = take_requests(state.session_id, lock_timeout=min(1.0, max(0.05, 3.0 - elapsed)))
+        except (GuardError, OSError) as exc:
+            log.warning("desktop-hook: fila de pedidos indisponível: %s", exc)
+    out: Optional[dict[str, Any]] = None
+    if event == "Stop" and actions:
+        out = {"decision": "block", "reason": request_notes(actions, event)}
+    elif event != "Stop" and (notes or actions):
+        lines = notes + ([request_notes(actions, event)] if actions else [])
+        out = {"hookSpecificOutput": {"hookEventName": event, "additionalContext": "\n".join(lines)}}
+    if out is not None:
+        log.info("desktop-hook: %s %s: notas %s | pedidos %s", event, state.session_id[:8],
+                 " | ".join(notes) or "-", ", ".join(actions) or "-")
+        try:
+            # ASCII puro: o JSON chega igual qualquer que seja a codificação do pipe.
+            sys.stdout.buffer.write(json.dumps(out).encode("ascii"))
+            sys.stdout.flush()
+        except Exception:
+            if actions:  # não chegaram ao Claude: voltam para a fila
+                with contextlib.suppress(Exception):
+                    restore_requests(state.session_id, actions, now)
+            raise
+    # Estado só depois da saída: falhar aqui (antivírus, disco) não perde pedido
+    # já retirado, e um pedido devolvido à fila não fica marcado como entregue.
+    # Sem trava no estado: se outro hook entregou algo enquanto este rodava,
+    # o que ele gravou (economy_mode, delivered_*) não pode ser desfeito aqui.
+    disk = read_json(path)
+    if isinstance(disk, dict):
+        with contextlib.suppress(TypeError, ValueError):
+            state = merge_concurrent_delivery(state, DesktopSessionState.from_json(disk))
+    if actions:
+        state = apply_delivery(state, actions, event, now)
+    try:
+        atomic_write_json(path, state.to_json())
+    except OSError as exc:
+        log.warning("desktop-hook: estado da sessão não gravado: %s", exc)
     # Registra os alertas mesmo com o toast desligado: religá-lo não repete
     # avisos de uma janela que já passou por eles. Falhar aqui não perde a nota.
     show = cfg["desktop"]["toast"] and cfg["notifications"]["desktop"]
@@ -3164,7 +3531,62 @@ def run_desktop_hook(args: argparse.Namespace) -> int:
 # Instalação para o Claude Desktop (hooks no settings.json, skill e atalho)
 # --------------------------------------------------------------------------
 
-SKILL_ASSET = "skills/economia-de-cota/SKILL.md"
+SKILL_NAMES = ("economia-de-cota", "ferramentas-do-projeto", "pesquisar-otimizacoes")
+
+
+# SHA-256 das versões empacotadas anteriores: uma cópia idêntica a uma delas não
+# foi editada pelo usuário e é atualizada (ou removida) sem pedir --force.
+# Ao mudar uma skill, acrescente aqui o hash da versão que saiu.
+SKILL_PREVIOUS_SHA256: dict[str, set[str]] = {
+    "economia-de-cota": {"1a1a597eda9fd25216cd3f8ad057a6d4cfd98c96bd6d8a6555d13b3bfc78e817",   # 1.3.0
+                         "b99cf6cfe2ca9fe8f1aa97377fff494f20e7b0547154ce443b7c8258f6bdac4d"},  # 1.4.0 provisória
+}
+
+
+def skill_asset(name: str) -> str:
+    return f"skills/{name}/SKILL.md"
+
+
+def _skill_is_ours(name: str, dst: Path, src: Optional[Path]) -> bool:
+    """A cópia instalada é a empacotada (atual ou anterior), sem edição do usuário?"""
+    data = dst.read_bytes()
+    if src is not None and data == src.read_bytes():
+        return True
+    return hashlib.sha256(data).hexdigest() in SKILL_PREVIOUS_SHA256.get(name, set())
+
+
+def install_skill(name: str, force: bool) -> None:
+    """Copia a skill empacotada; mantém a do usuário se ele a editou (com
+    --force, substitui guardando backup)."""
+    src = asset_path(skill_asset(name))
+    dst = claude_config_dir() / "skills" / name / "SKILL.md"
+    if src is None:
+        print(f"skill {name}: ERRO arquivo empacotado não encontrado (assets/skills)")
+    elif dst.is_file() and not _skill_is_ours(name, dst, src) and not force:
+        print(f"skill {name}: {dst} foi modificada; mantive a sua (use --force para substituir, com backup)")
+    else:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if dst.is_file() and not _skill_is_ours(name, dst, src):
+            bak = dst.with_name(f"SKILL.md.bak-{_stamp()}")
+            shutil.copy2(dst, bak)
+            print(f"skill {name}: backup da sua versão em {bak}")
+        shutil.copyfile(src, dst)
+        print(f"skill {name}: {dst}")
+
+
+def uninstall_skill(name: str) -> None:
+    """Remove a skill só se ela for idêntica à empacotada."""
+    src = asset_path(skill_asset(name))
+    dst = claude_config_dir() / "skills" / name / "SKILL.md"
+    if not dst.is_file():
+        return
+    if _skill_is_ours(name, dst, src):
+        dst.unlink()
+        with contextlib.suppress(OSError):
+            dst.parent.rmdir()  # só se ficou vazia
+        print(f"skill {name}: removida ({dst})")
+    else:
+        print(f"skill {name}: {dst} foi modificada; não removi")
 
 
 def _replace_with_retry(tmp: Path, path: Path) -> None:
@@ -3348,20 +3770,8 @@ def cmd_install_desktop(_cfg: dict[str, Any], args: argparse.Namespace) -> int:
     print(f"  hooks SessionStart, UserPromptSubmit e Stop → {command}")
     print(f"  backup: {backup}" if backup else "  (arquivo novo)")
 
-    src = asset_path(SKILL_ASSET)
-    dst = claude_config_dir() / "skills" / "economia-de-cota" / "SKILL.md"
-    if src is None:
-        print("skill: ERRO arquivo empacotado não encontrado (assets/skills)")
-    elif dst.is_file() and dst.read_bytes() != src.read_bytes() and not args.force:
-        print(f"skill: {dst} foi modificada; mantive a sua (use --force para substituir, com backup)")
-    else:
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        if dst.is_file() and dst.read_bytes() != src.read_bytes():
-            bak = dst.with_name(f"SKILL.md.bak-{_stamp()}")
-            shutil.copy2(dst, bak)
-            print(f"skill: backup da sua versão em {bak}")
-        shutil.copyfile(src, dst)
-        print(f"skill: {dst}")
+    for name in SKILL_NAMES:
+        install_skill(name, args.force)
 
     lnk = create_start_menu_shortcut()
     if lnk:
@@ -3389,16 +3799,8 @@ def cmd_uninstall_desktop(_cfg: dict[str, Any], _args: argparse.Namespace) -> in
     else:
         print(f"settings.json: nenhum hook do guard em {path}")
 
-    src = asset_path(SKILL_ASSET)
-    dst = claude_config_dir() / "skills" / "economia-de-cota" / "SKILL.md"
-    if dst.is_file():
-        if src is not None and dst.read_bytes() == src.read_bytes():
-            dst.unlink()
-            with contextlib.suppress(OSError):
-                dst.parent.rmdir()  # só se ficou vazia
-            print(f"skill: removida ({dst})")
-        else:
-            print(f"skill: {dst} foi modificada; não removi")
+    for name in SKILL_NAMES:
+        uninstall_skill(name)
     lnk = start_menu_shortcut_path()
     if lnk.exists():
         with contextlib.suppress(OSError):

@@ -1,5 +1,7 @@
 import time
 
+import pytest
+
 NOW = time.time()
 
 
@@ -104,3 +106,12 @@ def test_stop_is_silent(cug, make_snap):
 def test_state_roundtrip(cug):
     st = cug.DesktopSessionState("s1", cwd="F:/Projetos/Açúcar", context_tokens=5)
     assert cug.DesktopSessionState.from_json({**st.to_json(), "extra": 1}) == st
+
+
+@pytest.mark.parametrize("source,economy,expected", [("compact", True, True), ("clear", True, True),
+                                                     ("startup", True, False), ("resume", True, False),
+                                                     ("compact", False, False)])
+def test_economy_reminder_after_clear_or_compact(cug, make_snap, source, economy, expected):
+    st = cug.DesktopSessionState("s1", economy_mode=economy)
+    notes, _, _ = cug.advise(cfg_(cug), make_snap(10, 10), st, "SessionStart", source, NOW)
+    assert (cug.ECONOMY_REMINDER in notes) is expected

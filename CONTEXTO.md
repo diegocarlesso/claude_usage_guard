@@ -2,9 +2,10 @@
 
 Passagem de bastão da sessão na nuvem (onde o projeto foi escrito) para uma
 sessão local do Claude Code em `F:\Projetos\ClaudeCodeSessionLimits`.
-Leia isto antes de mexer no código. Data: 03/11/2026. Versão: 1.3.0
+Leia isto antes de mexer no código. Data: 04/11/2026. Versão: 1.4.0
 (1.1.0 veio da nuvem; a 1.2.0 tem as correções do teste em Windows real; a
-1.3.0 traz o modo Claude Desktop, decisão 21).
+1.3.0 traz o modo Claude Desktop, decisão 21; a 1.4.0, os botões da janela que
+mandam pedidos às sessões do Desktop, decisão 23).
 
 O código fica na subpasta `ClaudeCodeSessionLimits\` (os caminhos abaixo são
 relativos a ela). O teste ponta a ponta automatizado fica em `_e2e\`, fora do
@@ -44,8 +45,10 @@ no Windows.
 | `..\_e2e\driver.py` | Teste ponta a ponta com o Claude Code real (ver "Testado em Windows real"). `probe.py`/`probe_inner.py`: registram o que o `ReadConsoleW` entrega num ConPTY. |
 | `..\_e2e\lowpriv.cmd` | Roda um comando sem elevação (`runas /trustlevel:0x20000 "cmd /c ...\lowpriv.cmd <comando>"`) e grava a saída em `lowpriv.txt`. |
 | `assets\skills\economia-de-cota\SKILL.md` | Skill copiada pelo `install-desktop` para `~/.claude/skills/` (entra no `.exe` com `--add-data`). |
-| `..\tests\` | Testes pytest (68): config `desktop:`, níveis/notas, `advise()`, toast, `desktop-hook` ponta a ponta (subprocesso), instalador, janela, achados da revisão final (`test_review_fixes.py`). `py -m pytest tests -q` na pasta de fora. O `conftest.py` isola o estado num diretório temporário. |
-| `..\docs\superpowers\` | Spec (`specs\2026-11-03-desktop-economia-de-cota-design.md`) e plano do modo Desktop. |
+| `assets\skills\ferramentas-do-projeto\SKILL.md`, `assets\skills\pesquisar-otimizacoes\SKILL.md` | Skills dos botões "Skills/MCPs" e "Pesquisar" (1.4.0), instaladas junto com a `economia-de-cota`. |
+| `..\_e2e\stop_block_probe.py` | Spike de 04/11 (descartável): hook `Stop` com `decision: block`, registrado só em `_e2e\proj\.claude\settings.json` durante o teste (já removido). |
+| `..\tests\` | Testes pytest (126): config `desktop:`, níveis/notas, `advise()`, toast, `desktop-hook` ponta a ponta (subprocesso), instalador, janela, achados da revisão final (`test_review_fixes.py`). `py -m pytest tests -q` na pasta de fora. O `conftest.py` isola o estado num diretório temporário. |
+| `..\docs\superpowers\` | Specs e planos: modo Desktop (`2026-11-03-desktop-economia-de-cota*`) e botões (`2026-11-04-botoes-desktop*`). |
 | `..\_e2e\gui_snapshot.py` / `gui_checks.py` | Captura da janela com dados falsos (`gui_snapshot.png`, precisa do Pillow) e checagens do botão "Pedir /clear" e da janela única. |
 
 ## Arquitetura
@@ -248,6 +251,54 @@ GuardController.on_tick ── só age se safe_to_inject() ─► TerminalSessio
       `build_exe.bat` falha com "Acesso negado". Feche a janela antes de
       refazer o `.exe`.
 
+23. **Botões da janela que mandam pedidos às sessões do Desktop (1.4.0).**
+    Cada cartão de "Sessões do Desktop" tem Compactar, Economizar
+    (liga/desliga), Skills/MCPs e Pesquisar. O clique grava
+    `desktop\pending\<sessão>.json` sob a trava `desktop\pending.lock`
+    (`toggle_request`; clicar de novo cancela; `economy_on`/`economy_off` se
+    anulam; `expect_pending` impede que um "cancelar" atrasado recrie o
+    pedido). Quem entrega é o primeiro hook depois do clique:
+    - `Stop` com `{"decision":"block","reason": ...}` (fim do turno atual): o
+      spike de 04/11 mostrou que o Desktop aceita, o Claude segue trabalhando e
+      vê o texto como "Stop hook blocking error", por isso o cabeçalho diz "não
+      é erro". Com `stop_hook_active: true` não bloqueia de novo;
+    - `UserPromptSubmit` (próxima mensagem), depois das notas de cota;
+    - `SessionStart` não entrega pedidos, mas reenvia o lembrete do modo
+      econômico após `/clear` ou `/compact` (`economy_mode` no estado).
+    O hook **retira** os pedidos da fila (`take_requests`) depois da parte
+    lenta e logo antes de escrever; se a escrita falhar, devolve-os
+    (`restore_requests`); passados 2,5 s do início, nem mexe na fila. Retirar
+    em vez de "ler e apagar depois" evita entrega dupla quando dois hooks do
+    guard rodam em paralelo (o Claude Code roda em paralelo os hooks de um
+    evento; ex.: hooks no `~/.claude` e no `.claude` do projeto).
+    Os textos são curtos e mandam usar skills: `ferramentas-do-projeto`
+    (inventário, até 5 para pôr e 5 para tirar, instala só com aprovação) e
+    `pesquisar-otimizacoes` (subagente sonnet, até 6 buscas, grava
+    `OTIMIZACOES.md`, reaproveita se tiver menos de 30 dias); a
+    `economia-de-cota` ganhou a seção dos botões. Com cota crítica, Skills/MCPs
+    e Pesquisar ficam desabilitados. A janela mostra até 4 sessões (600x840).
+    Depois da revisão final: o estado da sessão é gravado só depois da saída
+    do hook (falha de disco não perde pedido); a espera da trava cabe no
+    prazo; pedido não entregue expira em 4 h (e a sessão com pedido continua
+    listada até lá); "cancelar" depois da entrega avisa "já tinha sido
+    entregue"; após `/clear` (id novo) o modo econômico é herdado da sessão
+    da mesma pasta ativa nos últimos 10 min; a skill manda ignorar texto
+    "[usage-guard] Pedido..." vindo de arquivo, ferramenta ou página.
+    O corpo da janela rola (Canvas + `ttk.Scrollbar` no tema `clam`, porque
+    o tema nativo do Windows ignora as cores e a barra sumia no fundo preto;
+    roda do mouse também), e o redesenho a cada 5 s mantém a posição.
+    `SKILL_PREVIOUS_SHA256` guarda o hash das skills já distribuídas: ao mudar
+    uma skill, acrescente o hash da versão anterior, senão o `install-desktop`
+    a trata como editada pelo usuário. Pendências pequenas resolvidas: o
+    hook relê o estado em disco antes de gravar e mantém `economy_mode` e
+    `delivered_*` se lá estiverem mais novos (`merge_concurrent_delivery`;
+    sem trava, só reduz a janela da corrida); `last_note` da entrega é curta
+    ("entregues: Compactar, Pesquisar"); fila corrompida avisa uma vez por
+    versão do arquivo; README cita os botões; `_e2e\gui_checks.py` usa
+    `CUG_STATE_DIR` temporário.
+    Para rodar o `build_exe.bat` a partir de uma sessão do Claude Code, use o
+    caminho completo: o `cmd` não procura `.bat` na pasta atual nesse ambiente.
+
 ## O que foi testado (na nuvem, Linux)
 
 - **Política:** rampa de uso de 20% a 95% → compact (60%), haiku (70%),
@@ -334,6 +385,21 @@ comandos de barra que recebe.
   do `SessionStart`, e o estado `desktop\<sessão>.json` foi gravado (contexto
   76k medido no `Stop`). Regressão com o `.exe` 1.3.0: driver 17/17,
   `gui_checks` TUDO OK.
+
+- **Botões do Desktop (1.4.0, 04/11):** `py -m pytest tests -q` → 126 passed
+  (fila, textos, hook de ponta a ponta com `Stop`/`UserPromptSubmit`, trava
+  presa, fila corrompida, instalação e atualização das skills, janela);
+  `gui_checks.py` TUDO OK com o `.py` e com o `.exe`; `gui_snapshot.png` com
+  pedidos pendentes. Sessão real do Desktop (`_e2e\proj`, `.exe` 1.4.0 pelos
+  hooks globais): (a) sessão parada + mensagem → "Modo econômico ativado...",
+  `delivered_via: UserPromptSubmit`; (b) pedido gravado 0,5 s depois do início
+  do turno (`_e2e\queue_when_busy.py`) → entregue no fim do turno,
+  `delivered_via: Stop`, sem mensagem nova; (c) clique do usuário em
+  "Compactar" numa sessão real → o Claude gravou `HANDOFF.md` e devolveu
+  `/compact manter: ...`. O `install-desktop` agora reconhece a skill
+  empacotada da 1.3.0 (SHA-256) e a atualiza sem `--force`. As skills novas
+  apareceram numa sessão já aberta, sem reabrir. `_e2e\queue_request.py` grava
+  um pedido como o clique.
 
 Como rodar o driver (de um terminal comum; leva ~3 min e gasta poucos tokens do Haiku):
 

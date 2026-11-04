@@ -51,7 +51,8 @@ Arquivos desta pasta
      - acrescenta 3 hooks do guard ao %USERPROFILE%\.claude\settings.json
        (seus outros hooks e configurações ficam iguais; antes grava um
        backup settings.json.bak-AAAAMMDD-HHMMSS ao lado);
-     - copia a skill economia-de-cota para %USERPROFILE%\.claude\skills\;
+     - copia as skills economia-de-cota, ferramentas-do-projeto e
+       pesquisar-otimizacoes para %USERPROFILE%\.claude\skills\;
      - cria o atalho "Claude Usage Guard" no Menu Iniciar (abre a janela).
    O que muda: em cada sessão NOVA da aba Code, quando a cota passa de 60%
    (5h) ou 70% (semana), o Claude recebe uma nota "[usage-guard]" e passa a
@@ -63,6 +64,17 @@ Arquivos desta pasta
    A janela (atalho ou "claude_usage_guard.exe gui") mostra as sessões do
    Desktop das últimas 2 horas e uma faixa amarela/vermelha com a cota alta.
    Limiares: seção desktop: do config.yaml.
+   Cada sessão na janela tem 4 botões que mandam um pedido ao Claude dela:
+     - Compactar: ele grava HANDOFF.md e te dá uma linha "/compact ..." pronta
+       para colar (quem roda o /compact é você);
+     - Economizar: liga o modo econômico até você clicar de novo;
+     - Skills/MCPs: ele sugere o que pôr e tirar e só instala o que você
+       aprovar;
+     - Pesquisar: ele pesquisa como gastar menos e boas práticas do projeto,
+       grava OTIMIZACOES.md e só aplica o que você aprovar.
+   O pedido chega no fim do turno, se o Claude estiver trabalhando, ou junto
+   da sua próxima mensagem (até um "ok" serve). Clicar de novo cancela. Com a
+   cota crítica, Skills/MCPs e Pesquisar ficam desligados.
    Se mudar a pasta do guard de lugar, rode install-desktop de novo
    (check-config avisa). Para desfazer:
        claude_usage_guard.exe uninstall-desktop

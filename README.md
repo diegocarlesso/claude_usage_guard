@@ -6,6 +6,10 @@ Guarda de consumo das cotas de 5 horas e semanal da assinatura Claude (Pro/Max) 
   `[usage-guard]` ao Claude quando a cota sobe ou o contexto cresce (economizar, subagentes mais baratos,
   `/compact` ou `/clear` com resumo de passagem), mostram toasts do Windows e listam as sessões na janela do guard.
   Instala também a skill `economia-de-cota`. `uninstall-desktop` desfaz.
+  Cada sessão ganha na janela do guard quatro botões: **Compactar** (resumo de passagem e linha `/compact`),
+  **Economizar** (liga/desliga o modo econômico), **Skills/MCPs** (skill `ferramentas-do-projeto`) e **Pesquisar**
+  (skill `pesquisar-otimizacoes`). O clique grava um pedido na fila da sessão e o hook o entrega ao Claude no fim
+  do turno (`Stop`) ou junto da próxima mensagem (`UserPromptSubmit`).
 - **Terminal:** `claude_usage_guard.exe run` abre o Claude Code num pseudo-terminal e aplica `/compact`, `/clear`,
   troca de modelo e failover opcional quando é seguro.
 

@@ -2,12 +2,16 @@
 import ctypes
 import datetime as dt
 import importlib.util
+import os
 import sys
+import tempfile
 import time
 from pathlib import Path
 
 from PIL import ImageGrab
 
+# Estado temporário: a fila de pedidos falsa não pode ir para o ~/.claude-usage-guard real.
+os.environ["CUG_STATE_DIR"] = tempfile.mkdtemp(prefix="cug-snapshot-")
 spec = importlib.util.spec_from_file_location("cug", sys.argv[1])
 cug = importlib.util.module_from_spec(spec)
 sys.modules["cug"] = cug
@@ -37,10 +41,14 @@ acts = [
 ]
 desk = [
     cug.DesktopSessionState("5f1e2d3c-aaaa", cwd="F:/Projetos/Açúcar", updated_at=now - 600, context_tokens=132_400,
-                            last_level="high", last_note=cug.context_note(132_400)),
-    cug.DesktopSessionState("9a8b7c6d-bbbb", cwd="F:/Projetos/Origo", updated_at=now - 3000, context_tokens=41_000,
-                            last_level="attention"),
+                            last_level="high", last_note=cug.context_note(132_400), last_event="UserPromptSubmit"),
+    cug.apply_delivery(
+        cug.DesktopSessionState("9a8b7c6d-bbbb", cwd="F:/Projetos/Origo", updated_at=now - 3000,
+                                context_tokens=41_000, last_level="attention", last_event="Stop"),
+        ["economy_on", "compact", "research"], "Stop", now - 120),
 ]
+cug.toggle_request("5f1e2d3c-aaaa", "compact", now)
+cug.toggle_request("5f1e2d3c-aaaa", "research", now)
 win = cug.GuardWindow(cfg, lambda: (snap, None, insts[:1], acts, desk))
 win.refresh(reschedule=False)
 win.root.update()

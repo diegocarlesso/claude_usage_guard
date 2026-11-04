@@ -141,3 +141,117 @@ def test_state_path_validation(cug, state_dir):
     for bad in ("../x", "abc", "a" * 81, "aaaaaaaa/../b"):
         with pytest.raises(cug.GuardError):
             cug.desktop_state_path(bad)
+
+
+# ---- pedidos dos botões da janela (1.4.0) -----------------------------------
+
+def queue(tmp_path, *actions):
+    p = tmp_path / "desktop" / "pending" / f"{SID}.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({"session_id": SID, "requests": [{"action": a, "at": 1.0} for a in actions]}),
+                 encoding="utf-8")
+    return p
+
+
+def test_prompt_delivers_request_after_quota_note(tmp_path, hook_env, make_snap):
+    write_cache(tmp_path, make_snap, 83)
+    queue(tmp_path, "compact")
+    r, _ = run_hook(hook_env, payload("hook_user_prompt.json"))
+    ctx = json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"].split("\n")
+    assert ctx[0].startswith("[usage-guard] Cota 5h em 83%")
+    assert ctx[1].startswith('[usage-guard] Pedido do usuário pelo botão "Compactar"')
+    assert not (tmp_path / "desktop" / "pending" / f"{SID}.json").exists()
+    st = json.loads((tmp_path / "desktop" / f"{SID}.json").read_text(encoding="utf-8"))
+    assert (st["delivered_actions"], st["delivered_via"], st["last_event"]) == \
+           (["compact"], "UserPromptSubmit", "UserPromptSubmit")
+
+
+def test_stop_blocks_with_request(tmp_path, hook_env, make_snap):
+    write_cache(tmp_path, make_snap, 10)
+    queue(tmp_path, "research")
+    r, _ = run_hook(hook_env, payload("hook_stop.json"))
+    out = json.loads(r.stdout)
+    assert out["decision"] == "block" and "pesquisar-otimizacoes" in out["reason"]
+    assert "(não é erro; faça agora)" in out["reason"] and r.stdout.isascii()
+
+
+def test_stop_hook_active_does_not_block(tmp_path, hook_env, make_snap):
+    write_cache(tmp_path, make_snap, 10)
+    queue(tmp_path, "compact")
+    r, _ = run_hook(hook_env, payload("hook_stop.json", stop_hook_active=True))
+    assert (r.returncode, r.stdout) == (0, b"")
+    assert (tmp_path / "desktop" / "pending" / f"{SID}.json").exists()
+
+
+def test_stop_without_stop_hook_active_key_delivers(tmp_path, hook_env, make_snap):   # Review Focus 4
+    write_cache(tmp_path, make_snap, 10)
+    queue(tmp_path, "tools")
+    data = payload("hook_stop.json")
+    del data["stop_hook_active"]
+    assert json.loads(run_hook(hook_env, data)[0].stdout)["decision"] == "block"
+
+
+def test_economy_reminder_after_compact(tmp_path, hook_env, make_snap):
+    write_cache(tmp_path, make_snap, 10)
+    queue(tmp_path, "economy_on")
+    run_hook(hook_env, payload("hook_user_prompt.json"))
+    r, _ = run_hook(hook_env, payload("hook_session_start.json", source="compact"))
+    assert "Modo econômico ligado pelo usuário" in json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
+
+
+def test_corrupted_queue_keeps_quota_note(tmp_path, hook_env, make_snap):
+    write_cache(tmp_path, make_snap, 83)
+    p = tmp_path / "desktop" / "pending" / f"{SID}.json"
+    p.parent.mkdir(parents=True)
+    p.write_text("{oops", encoding="utf-8")
+    r, _ = run_hook(hook_env, payload("hook_user_prompt.json", session_id=SID))
+    assert r.returncode == 0 and "Cota 5h em 83%" in r.stdout.decode()
+
+
+def test_session_start_does_not_deliver(tmp_path, hook_env, make_snap):
+    write_cache(tmp_path, make_snap, 10)
+    queue(tmp_path, "compact")
+    r, _ = run_hook(hook_env, payload("hook_session_start.json", source="clear"))
+    assert r.stdout == b"" and (tmp_path / "desktop" / "pending" / f"{SID}.json").exists()
+
+
+def test_locked_queue_keeps_note_and_request(cug, tmp_path, hook_env, make_snap):   # Review Focus 5
+    write_cache(tmp_path, make_snap, 83)
+    queue(tmp_path, "compact")
+    with cug.file_lock(tmp_path / "desktop" / "pending.lock", timeout=2):
+        r, took = run_hook(hook_env, payload("hook_user_prompt.json"))
+    ctx = json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "Cota 5h em 83%" in ctx and "Pedido" not in ctx and took < 3
+    assert (tmp_path / "desktop" / "pending" / f"{SID}.json").exists()
+
+
+def test_state_write_failure_still_delivers(cug, state_dir, tmp_path, monkeypatch, capsysbinary):   # revisão I3
+    import io
+    cug.toggle_request(SID, "compact", time.time())
+    real = cug.atomic_write_json
+
+    def boom(path, data):
+        if path.name == f"{SID}.json" and path.parent.name == "desktop":
+            raise PermissionError("antivírus")
+        return real(path, data)
+    monkeypatch.setattr(cug, "atomic_write_json", boom)
+    monkeypatch.setattr(cug, "load_snapshot_for_hook", lambda cfg, network=True: None)
+    monkeypatch.setattr(cug.sys, "stdin", io.TextIOWrapper(io.BytesIO(
+        json.dumps(payload("hook_user_prompt.json")).encode("utf-8"))))
+    cfg, _ = cug.load_config(None)
+    assert cug.cmd_desktop_hook(cfg, None) == 0
+    out = json.loads(capsysbinary.readouterr().out)
+    assert "Compactar" in out["hookSpecificOutput"]["additionalContext"]
+
+
+def test_clear_inherits_economy_mode(tmp_path, hook_env, make_snap):     # revisão I4
+    write_cache(tmp_path, make_snap, 10)
+    old = {"session_id": SID, "cwd": r"F:\Projetos\Açúcar", "updated_at": time.time() - 30, "economy_mode": True}
+    d = tmp_path / "desktop"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"{SID}.json").write_text(json.dumps(old), encoding="utf-8")
+    new_sid = "99999999-8888-7777-6666-555555555555"
+    r, _ = run_hook(hook_env, payload("hook_session_start.json", source="clear", session_id=new_sid))
+    assert "Modo econômico ligado pelo usuário" in json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
+    st = json.loads((d / f"{new_sid}.json").read_text(encoding="utf-8"))
+    assert st["economy_mode"] is True

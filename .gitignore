@@ -16,3 +16,6 @@ _e2e/proj/
 /assets/
 /claude_usage_guard/
 *.zip
+
+# Nota de passagem entre sessões (local)
+/HANDOFF.md
